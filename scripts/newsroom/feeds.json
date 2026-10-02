@@ -1,0 +1,11 @@
+{
+  "up": ["https://www.bhaskar.com/rss-v1--category-2052.xml", "https://www.amarujala.com/rss/uttar-pradesh.xml"],
+  "uk": [{ "index": "https://www.bhaskar.com/local/uttarakhand/", "links": "^/local/uttarakhand/[a-z0-9-]+/news/[a-z0-9-]+-\\d+\\.html$" }, "https://www.amarujala.com/rss/uttarakhand.xml"],
+  "delhi": ["https://www.abplive.com/states/delhi-ncr/feed", "https://www.bhaskar.com/rss-v1--category-7140.xml"],
+  "world": ["https://www.bhaskar.com/rss-v1--category-1125.xml", "https://feeds.bbci.co.uk/news/world/rss.xml"],
+  "dharma": ["https://www.abplive.com/religion/feed", "https://www.amarujala.com/rss/spirituality.xml"],
+  "business": ["https://www.bhaskar.com/rss-v1--category-1051.xml", "https://www.abplive.com/business/feed"],
+  "sports": ["https://www.bhaskar.com/rss-v1--category-1053.xml", "https://feeds.bbci.co.uk/sport/rss.xml"],
+  "national": ["https://www.bhaskar.com/rss-v1--category-1061.xml", "https://www.abplive.com/news/feed"],
+  "lifestyle": ["https://www.abplive.com/lifestyle/feed", "https://www.abplive.com/photo-gallery/lifestyle/feed"]
+}

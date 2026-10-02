@@ -1,0 +1,10 @@
+{
+  "name": "tv10-india-newsroom",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.12.0" },
+  "dependencies": {
+    "cheerio": "1.2.0",
+    "fast-xml-parser": "5.11.2"
+  }
+}

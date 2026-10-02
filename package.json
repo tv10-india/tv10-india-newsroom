@@ -1,0 +1,15 @@
+{
+  "name": "tv10-india-newsroom-automation",
+  "version": "1.0.0",
+  "private": true,
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "newsroom:install": "npm ci --prefix scripts/newsroom --ignore-scripts --no-fund",
+    "newsroom:test": "node --test scripts/newsroom/*.test.mjs",
+    "newsroom:check": "node --env-file-if-exists=.env.newsroom scripts/newsroom/run.mjs --check",
+    "newsroom:dry-run": "node --env-file-if-exists=.env.newsroom scripts/newsroom/run.mjs --dry-run",
+    "newsroom:publish": "node --env-file-if-exists=.env.newsroom scripts/newsroom/run.mjs --publish"
+  }
+}

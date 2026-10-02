@@ -1,0 +1,87 @@
+name: TV10 India Hindi newsroom
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Dry-run writes review files only. Publish creates live articles.
+        type: choice
+        options:
+          - dry-run
+          - publish
+        default: dry-run
+        required: true
+      article_count:
+        description: Start with 1 article. Choose 18 for the full daily batch.
+        type: choice
+        options:
+          - '1'
+          - '18'
+        default: '1'
+        required: true
+      category:
+        description: Category for a one-article run. Ignored when article count is 18.
+        type: choice
+        options:
+          - up
+          - uk
+          - delhi
+          - world
+          - dharma
+          - business
+          - sports
+          - national
+          - lifestyle
+        default: up
+        required: true
+  schedule:
+    - cron: '0 5 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tv10-newsroom-production
+  cancel-in-progress: false
+
+jobs:
+  newsroom:
+    if: github.event_name == 'workflow_dispatch' || vars.NEWSROOM_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      NEWSROOM_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || (vars.NEWSROOM_PUBLISH == 'true' && 'publish' || 'dry-run') }}
+      NEWSROOM_ARTICLE_COUNT: ${{ github.event_name == 'workflow_dispatch' && inputs.article_count || '18' }}
+      NEWSROOM_CATEGORY: ${{ inputs.category || 'up' }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: scripts/newsroom/package-lock.json
+      - name: Install newsroom dependencies only
+        run: npm ci --prefix scripts/newsroom --ignore-scripts --no-fund
+      - name: Run offline newsroom tests
+        run: node --test scripts/newsroom/*.test.mjs
+      - name: Run newsroom
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          SANITY_API_TOKEN: ${{ env.NEWSROOM_MODE == 'publish' && secrets.SANITY_API_TOKEN || '' }}
+          SANITY_PROJECT_ID: ${{ vars.SANITY_PROJECT_ID || 'uh81euwc' }}
+          SANITY_DATASET: ${{ vars.SANITY_DATASET || 'production' }}
+          NEWSROOM_REQUEST_INTERVAL_MS: ${{ vars.NEWSROOM_REQUEST_INTERVAL_MS || '15000' }}
+        run: node scripts/newsroom/run.mjs "--$NEWSROOM_MODE"
+      - name: Save review files and diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: tv10-newsroom-${{ github.run_id }}-${{ github.run_attempt }}
+          path: newsroom-output/
+          if-no-files-found: ignore
+          retention-days: 7
