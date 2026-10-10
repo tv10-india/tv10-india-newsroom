@@ -2,42 +2,17 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import {
-  ArticleEvidenceError, ArticleLengthError, ArticleStructureError, ArticleValidationError, CATEGORIES, batchPlan, characterCount, creditFreeLicense, eligibleImage,
-  interleaveByRank, makeDocument, parseIndex, photoScore, portableText, postIds, similarTitle, validateArticleCandidates, validateArticles, verifyPosts,
+  ArticleEvidenceError, ArticleLengthError, ArticleStructureError, ArticleValidationError, CATEGORIES, batchPlan, batchSummary, characterCount,
+  interleaveByRank, makeDocument, parseIndex, portableText, postIds, quoteMatches, similarTitle, validateArticleCandidates, validateArticles, verifyPosts,
 } from './core.mjs';
 
 // Offline only: no network, no credentials. Run with `npm test`.
 
 const feeds = JSON.parse(await readFile(new URL('./feeds.json', import.meta.url), 'utf8'));
 
-const image = (licenseUrl, extra = {}) => ({ mime: 'image/jpeg', width: 1280, extmetadata: { LicenseUrl: { value: licenseUrl }, ...extra } });
-
-test('only credit-free licences are accepted', () => {
-  assert.ok(creditFreeLicense('https://creativecommons.org/publicdomain/zero/1.0/'));
-  assert.ok(creditFreeLicense('https://creativecommons.org/publicdomain/mark/1.0/'));
-  // CC BY and CC BY-SA oblige us to publish a credit, and the website has nowhere to show one.
-  assert.ok(!creditFreeLicense('https://creativecommons.org/licenses/by/4.0/'));
-  assert.ok(!creditFreeLicense('https://creativecommons.org/licenses/by-sa/3.0/'));
-  assert.ok(!creditFreeLicense('https://creativecommons.org/licenses/by-nc/4.0/'));
-  assert.ok(!creditFreeLicense('https://example.com/publicdomain/zero/1.0/'));
-  assert.ok(eligibleImage(image('https://creativecommons.org/publicdomain/zero/1.0/')));
-  assert.ok(!eligibleImage(image('https://creativecommons.org/licenses/by-sa/4.0/')));
-  assert.ok(!eligibleImage({ ...image('https://creativecommons.org/publicdomain/zero/1.0/'), width: 640 }));
-});
-
 test('editorial prompt advertises the same ceiling the validator enforces', async () => {
   const prompt = await readFile(new URL('./editorial-prompt.md', import.meta.url), 'utf8');
   assert.match(prompt, /1,500-2,900 Unicode characters/);
-});
-
-test('photoScore rejects artwork, artefacts and pre-1990 prints', () => {
-  const subject = (title, extra = {}) => photoScore({ title: `File:${title}` }, { extmetadata: extra }, 'kneaded dough');
-  assert.ok(subject('Kneading bread dough.jpg') > 0);
-  assert.equal(subject('Female figurine kneading dough MET GR690.jpg'), 0);
-  assert.equal(subject('Kneading dough, an engraving.jpg'), 0);
-  assert.equal(subject('Kneading dough.jpg', { DateTimeOriginal: { value: '1909' } }), 0);
-  // Stemming: the query says "kneaded", the file says "Kneading".
-  assert.ok(subject('Kneading Chapati Dough 01.jpg') >= 3);
 });
 
 test('similarTitle catches reworded repeats without flagging unrelated news', () => {
@@ -55,7 +30,7 @@ const paragraph = 'क'.repeat(400);
 let counter = 0;
 const article = (category) => ({
   category, title: `${category} शीर्षक ${++counter}`, slug: `slug-${category}-${counter}`, district: '',
-  tags: ['अ', 'ब', 'स'], sourceIds: [`${category}${String(counter).padStart(23, '0')}`], evidence: [], sources: [], image: null,
+  tags: ['अ', 'ब', 'स'], sourceIds: [`${category}${String(counter).padStart(23, '0')}`], evidence: [], sources: [],
   blocks: [{ type: 'paragraph', text: paragraph }, { type: 'heading', text: 'उपशीर्षक' }, { type: 'paragraph', text: paragraph },
     { type: 'paragraph', text: paragraph }, { type: 'heading', text: 'दूसरा' }, { type: 'paragraph', text: paragraph }],
 });
@@ -72,7 +47,7 @@ function buildBatch(perCategory = {}) {
     .map((item, index) => {
       const slot = (slots.get(item.category) ?? 0) + 1;
       slots.set(item.category, slot);
-      return makeDocument(item, index, '2026-10-01', now, 'asset-ref', plan, slot);
+      return makeDocument(item, index, '2026-10-01', now, plan, slot);
     });
 }
 
@@ -81,8 +56,8 @@ test('a short category does not shift every later article onto the wrong id', ()
   const documents = buildBatch({ delhi: 1, lifestyle: 1 });
   assert.equal(documents.length, 16);
   const ids = documents.map((document) => document._id);
-  assert.deepEqual(ids.filter((id) => id.includes('-delhi-')), ['tv10-newsroom-2026-10-01-delhi-1']);
-  assert.deepEqual(ids.filter((id) => id.includes('-sports-')), ['tv10-newsroom-2026-10-01-sports-1', 'tv10-newsroom-2026-10-01-sports-2']);
+  assert.deepEqual(ids.filter((id) => id.includes('-delhi-')), ['drafts.tv10-newsroom-2026-10-01-delhi-1']);
+  assert.deepEqual(ids.filter((id) => id.includes('-sports-')), ['drafts.tv10-newsroom-2026-10-01-sports-1', 'drafts.tv10-newsroom-2026-10-01-sports-2']);
   assert.equal(new Set(ids).size, ids.length);
   const verification = verifyPosts(documents, '2026-10-01', plan);
   assert.equal(verification.count, 16);
@@ -97,6 +72,28 @@ test('a full batch still verifies, and a batch below the minimum is rejected', (
   assert.equal(verifyPosts(buildBatch().slice(0, 1), '2026-10-01', plan).count, 1);
   assert.equal(verifyPosts(buildBatch().slice(0, 9), '2026-10-01', plan).count, 9);
   assert.throws(() => verifyPosts([], '2026-10-01', plan), /1-18 distinct batch post/);
+});
+
+test('every post is written as a draft waiting for an editor, never straight to the site', () => {
+  const plan = batchPlan(18);
+  const [document] = buildBatch();
+  assert.equal(document._id, 'drafts.tv10-newsroom-2026-10-01-up-1');
+  assert.equal(document.editorialStatus, 'in-review');
+  // Verification refuses anything public or already approved: that is the editor's call.
+  assert.throws(() => verifyPosts([{ ...document, _id: 'tv10-newsroom-2026-10-01-up-1' }], '2026-10-01', plan), /draft awaiting approval/);
+  assert.throws(() => verifyPosts([{ ...document, editorialStatus: 'published' }], '2026-10-01', plan), /draft awaiting approval/);
+  assert.equal(verifyPosts([document], '2026-10-01', plan).awaitingApproval, 1);
+});
+
+test('a later run reports what editors did with the batch instead of failing on it', () => {
+  const [approved, edited, waiting] = buildBatch();
+  const published = (document) => ({ ...document, _id: document._id.slice('drafts.'.length), editorialStatus: 'published' });
+  // edited was approved and published, then reopened: its new draft sits beside it.
+  const summary = batchSummary([published(approved), published(edited), edited, waiting]);
+  assert.deepEqual(summary.posts.map((post) => post._id), ['tv10-newsroom-2026-10-01-up-1', 'tv10-newsroom-2026-10-01-up-2', 'drafts.tv10-newsroom-2026-10-01-uk-1']);
+  assert.equal(summary.published, 2);
+  assert.equal(summary.drafts, 1);
+  assert.deepEqual(batchSummary([]), { posts: [], published: 0, drafts: 0 });
 });
 
 test('daily batches cover nine categories and exclude mystery', () => {
@@ -130,20 +127,17 @@ test('an 18-article run takes two from every category, whatever category was pic
   assert.deepEqual(postIds('2026-10-02', batchPlan(1, 'sports')), ['tv10-newsroom-test-2026-10-02-sports-1']);
 });
 
-test('published documents carry no caption, no image line and no outbound links', () => {
-  const plan = batchPlan(18);
-  const withImage = makeDocument({ ...article('up'), image: { kind: 'real-photo', license: 'CC0' } }, 0, '2026-10-01', new Date(), 'asset-1', plan, 1);
-  assert.ok(!('caption' in withImage.mainImage));
-  assert.equal(withImage.mainImage.alt, withImage.title);
-  // The body is exactly the model's blocks. Nothing is appended, so an article with a
-  // photo and one without publish the same text and the length the model was asked for
-  // is the length that reaches the page.
+test('documents carry no photo and no outbound links', () => {
   const source = article('up');
-  const blocks = portableText({ ...source, image: { kind: 'real-photo' } });
-  assert.equal(blocks.length, source.blocks.length);
-  assert.deepEqual(blocks.map((block) => block.children[0].text), source.blocks.map((block) => block.text));
-  assert.deepEqual(blocks, portableText({ ...source, image: null }));
-  assert.ok(blocks.every((block) => block.markDefs.length === 0));
+  const document = makeDocument(source, 0, '2026-10-01', new Date(), batchPlan(18), 1);
+  // Text only: keyword-matched Commons photos were too often of the wrong subject.
+  assert.ok(!('mainImage' in document));
+  assert.ok(!('image' in document.newsroom));
+  // The body is exactly the model's blocks. Nothing is appended, so the length the
+  // model was asked for is the length that reaches the page.
+  assert.deepEqual(document.body, portableText(source));
+  assert.deepEqual(document.body.map((block) => block.children[0].text), source.blocks.map((block) => block.text));
+  assert.ok(document.body.every((block) => block.markDefs.length === 0));
 });
 
 test('every source and evidence entry carries a unique _key', () => {
@@ -151,7 +145,7 @@ test('every source and evidence entry carries a unique _key', () => {
   // alert in place of any array of objects whose items have no _key.
   const sources = ['a', 'b'].map((id) => ({ id, url: `https://www.bhaskar.com/${id}`, title: 'स', publishedAt: null }));
   const evidence = [{ sourceId: 'a', quote: 'पहला' }, { sourceId: 'b', quote: 'दूसरा' }];
-  const { newsroom } = makeDocument({ ...article('up'), sources, evidence }, 0, '2026-10-01', new Date(), 'asset-1', batchPlan(18), 1);
+  const { newsroom } = makeDocument({ ...article('up'), sources, evidence }, 0, '2026-10-01', new Date(), batchPlan(18), 1);
   for (const list of [newsroom.sources, newsroom.evidence]) {
     assert.equal(list.length, 2);
     assert.ok(list.every((item) => typeof item._key === 'string' && item._key));
@@ -228,7 +222,7 @@ const payloadFor = (quote) => ({
   articles: [{
     title: 'गेहूं की नई किस्म से किसानों की पैदावार बढ़ी',
     slug: 'wheat-variety-yield', district: '', tags: ['गेहूं', 'किसान', 'पैदावार'],
-    sourceIds: [SOURCE_ID], evidence: [{ sourceId: SOURCE_ID, quote }], imageQueries: ['wheat farming'],
+    sourceIds: [SOURCE_ID], evidence: [{ sourceId: SOURCE_ID, quote }],
     blocks: [{ type: 'paragraph', text: paragraph }, { type: 'heading', text: 'उपशीर्षक' },
       { type: 'paragraph', text: paragraph }, { type: 'paragraph', text: paragraph },
       { type: 'heading', text: 'दूसरा' }, { type: 'paragraph', text: paragraph }],
@@ -318,6 +312,65 @@ test('a paraphrased quote is rejected, and the rejection is retryable', () => {
   // attempt, where a plain Error killed the category outright.
   assert.throws(() => validate('गेहूं की एक नई किस्म से पैदावार में भारी वृद्धि हुई है'), ArticleEvidenceError);
   assert.throws(() => validate(QUOTE.slice(0, 12)), ArticleEvidenceError);
+});
+
+// ABP Live as extracted: an English kicker, Hindi sentences ended with "." rather than
+// "।", straight double quotes, and a precomposed nukta letter (U+095D).
+const ABP = {
+  id: '0123456789abcdef01234567', url: 'https://www.abplive.com/a', title: 'दिल्ली में सीवर व्यवस्था पर 18,000 करोड़ रुपये खर्च होंगे',
+  text: 'Delhi News: दिल्ली में सीवर व्यवस्था सुधारने के लिए 18,000 करोड़ रुपये की योजना तैयार की जा रही है. जल बोर्ड ने कहा कि पुरानी पाइपलाइनें ब\u095Dते दबाव को सह नहीं पा रही हैं. मंत्री ने कहा, "काम अगले साल शुरू होगा".',
+};
+const BBC = { id: 'fedcba9876543210fedcba98', url: 'https://www.bbc.co.uk/news/a', title: 'Aid to resume', text: 'The United Nations said on Friday that aid deliveries to the region would resume next week.' };
+const citing = (source, ...evidence) => {
+  const payload = payloadFor(QUOTE);
+  Object.assign(payload.articles[0], { sourceIds: [source.id], evidence });
+  return payload;
+};
+const rejects = (source, evidence, pattern) => assert.throws(
+  () => validateArticles(citing(source, ...evidence), 'delhi', [source], [], 1),
+  (error) => error instanceof ArticleEvidenceError && /not an exact quote/.test(error.message) && pattern.test(error.message),
+);
+
+test('a quote that ends a sentence the Hindi way still matches a source that uses "."', () => {
+  // What a model writes when it copies across one of ABP's sentence ends. One TV10 run
+  // lost five articles on ABP sources to evidence errors, each failing twice.
+  const quote = 'करोड़ रुपये की योजना तैयार की जा रही है। जल बोर्ड ने कहा कि';
+  assert.ok(!ABP.text.includes(quote));
+  assert.deepEqual(validateArticles(citing(ABP, { sourceId: ABP.id, quote }), 'delhi', [ABP], [], 1)[0].evidence, [{ sourceId: ABP.id, quote }]);
+});
+
+test('invisible and typographic differences do not break a quote', () => {
+  assert.ok(quoteMatches(ABP.text, 'मंत्री ने कहा, “काम अगले साल शुरू होगा”।'));
+  assert.ok(quoteMatches(ABP.text, 'पुरानी पाइपलाइनें ब\u0922\u093Cते दबाव को सह नहीं पा रही हैं'));
+  assert.ok(quoteMatches(ABP.text, 'सुधारने के लिए १८,००० करोड़ रुपये की योजना'));
+  assert.ok(quoteMatches(ABP.text, 'जल बोर्ड ने कहा कि पुरानी पाइप\u200dलाइनें'));
+  assert.ok(quoteMatches(BBC.text, 'the united nations said on Friday that aid deliveries'));
+});
+
+test('a quote must still be the source\'s own words, in order, and says where it is not', () => {
+  rejects(ABP, [{ sourceId: ABP.id, quote: 'जल बोर्ड ने बताया कि पुरानी पाइपलाइनें बढ़ते दबाव को सह नहीं पा रही हैं' }],
+    /follows the source for 3 of its 15 words, then has "बताया" where the source has "कहा"/);
+  rejects(ABP, [{ sourceId: ABP.id, quote: 'मंत्री ने कहा, "काम अगले साल शुरू होगा" और बजट भी तय है' }],
+    /follows the source for 8 of its 13 words, then has "और" where the supplied text ends/);
+  rejects(BBC, [{ sourceId: BBC.id, quote: 'संयुक्त राष्ट्र ने शुक्रवार को कहा कि सहायता अगले सप्ताह फिर शुरू होगी' }],
+    /first word "संयुक्त" does not appear in that source's text; evidence is never translated/);
+  rejects(ABP, [{ sourceId: ABP.id, quote: ABP.title }], /quotes the headline/);
+  rejects(ABP, [{ sourceId: ABP.id, quote: 'जल बोर्ड ने कहा' }], /the quote is 15 characters long/);
+  rejects(ABP, [], /no evidence item names it/);
+});
+
+test('a quote of punctuation alone proves nothing', () => {
+  // It folds to an empty string, and every source text contains the empty string.
+  assert.equal(quoteMatches(ABP.text, '। '.repeat(20)), false);
+  rejects(ABP, [{ sourceId: ABP.id, quote: '। '.repeat(20) }], /mostly punctuation/);
+});
+
+test('any matching quote proves a source, and only matching quotes are stored', () => {
+  const reworded = { sourceId: ABP.id, quote: 'जल बोर्ड ने बताया कि पुरानी पाइपलाइनें बढ़ते दबाव को सह नहीं पा रही हैं' };
+  const exact = { sourceId: ABP.id, quote: 'पुरानी पाइपलाइनें ब\u095Dते दबाव को सह नहीं पा रही हैं' };
+  const uncited = { sourceId: BBC.id, quote: 'The United Nations said on Friday that aid deliveries' };
+  const [article] = validateArticles(citing(ABP, reworded, exact, uncited), 'delhi', [ABP, BBC], [], 1);
+  assert.deepEqual(article.evidence, [exact]);
 });
 
 const withParagraphs = (text) => {

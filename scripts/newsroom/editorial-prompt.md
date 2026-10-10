@@ -50,7 +50,6 @@ Return only a JSON object of this exact shape (no Markdown fences):
     "tags": ["पहला उपयुक्त हिंदी टैग", "दूसरा उपयुक्त हिंदी टैग", "तीसरा उपयुक्त हिंदी टैग"],
     "sourceIds": ["one or more IDs from the supplied source records"],
     "evidence": [{"sourceId": "a referenced source ID", "quote": "a short exact substring copied from that source text, 30-180 characters"}],
-    "imageQueries": ["short English subject", "broader subject"],
     "blocks": [
       {"type": "paragraph", "text": "स्थान: मुख्य समाचार का पूरा पहला अनुच्छेद यहाँ लिखें।"},
       {"type": "heading", "text": "पहला उपशीर्षक"},
@@ -65,15 +64,9 @@ Return only a JSON object of this exact shape (no Markdown fences):
 }
 
 blocks must contain the whole article, using only paragraph, heading, or bullet types.
-Supply up to three imageQueries, each containing 1-3 English words naming the main
-physical subject supported by this article, for example "potatoes" or "food processing".
-Avoid scene descriptions, unrelated scenery, named people, logos and speculative
-depictions of future buildings. Queries find representative real photos, not proof
-of the event. If no subject is suitable, return an empty imageQueries array.
-Do not return photo URLs or image-generation prompts, and do not write a caption,
-photo credit, or any line describing the image. The runner
-uses a credit-free (CC0 or public domain) relevant real photo if available, otherwise
-no image at all.
+Articles are published as text only, with no photo. Do not return photo URLs, image
+search terms or image-generation prompts, and do not write a caption, photo credit,
+or any line describing a picture.
 Every block must be an object with exactly this shape: {"type":"paragraph","text":"..."}.
 Use the literal English keys type and text, and the literal lowercase English type
 values paragraph, heading, or bullet. Only the text value is Hindi. Do not use
@@ -89,8 +82,7 @@ quote that is not an exact substring of its source costs the whole article. Some
 are written in English; their quotes stay in English, character-for-character, even though
 the article you write from them is in Hindi. Evidence is never translated. Evidence is
 internal audit data, not part of the published body. Order multiple articles from
-less to more newsworthy. Real photos are representative, not photos of the event, so
-never write the body as if the reader can see the pictured scene.
+less to more newsworthy.
 
 If correctionRequest is present, previousResponse contains only the failed articles;
 articles already accepted are retained by the runner and must not be returned again.

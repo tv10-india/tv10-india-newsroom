@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { configuration, generateValidatedCategory, sanityClient, verifyHomepage } from './run.mjs';
+import { configuration, generateValidatedCategory, sanityClient } from './run.mjs';
 import { QuotaError, batchPlan, dayInIndia, makeDocument, validateArticles, verifyPosts } from './core.mjs';
 
 const quote = 'This source text contains an exact excerpt used only in offline tests.';
@@ -9,7 +9,7 @@ const paragraph = 'यह केवल परीक्षण का पाठ �
 const draft = (index) => ({
   title: index === 1 ? 'विद्यालय में नई पुस्तकालय सुविधा शुरू' : 'खेल प्रतियोगिता में खिलाड़ियों की शानदार जीत',
   slug: `test-article-${index}`, district: '', tags: ['शिक्षा', 'विकास', 'खेल'],
-  sourceIds: [`source-${index}`], evidence: [{ sourceId: `source-${index}`, quote }], imageQueries: [],
+  sourceIds: [`source-${index}`], evidence: [{ sourceId: `source-${index}`, quote }],
   blocks: [{ type: 'paragraph', text: paragraph }, { type: 'heading', text: 'नई सुविधा' },
     ...Array.from({ length: 4 }, () => ({ type: 'paragraph', text: paragraph }))],
 });
@@ -34,6 +34,8 @@ async function exercise(context, responses, count = 2) {
     assert.equal(schema.properties.articles.maxItems, request.requestedArticleCount);
     assert.deepEqual(schema.properties.articles.items.properties.blocks.items.properties.type.enum, ['paragraph', 'heading', 'bullet']);
     assert.equal(schema.properties.articles.items.properties.blocks.items.properties.text.type, 'STRING');
+    // Posts are text only, so the model is never asked for photo search terms.
+    assert.ok(!('imageQueries' in schema.properties.articles.items.properties) && !schema.properties.articles.items.required.includes('imageQueries'));
     requests.push(request);
     assert.ok(requests.length <= responses.length, 'Unexpected extra request');
     const response = responses[requests.length - 1];
@@ -126,27 +128,29 @@ test('configuration is isolated to TV10 and small batches are allowed', () => {
   assert.throws(() => configuration({ SANITY_DATASET: 'otherdataset' }), /targets only TV10/);
 });
 
-test('TV10 documents use its published status, priority and existing desk author', () => {
+test('TV10 documents are drafts awaiting approval, with its priority and existing desk author', () => {
   const plan = batchPlan(18);
   const now = new Date();
   const day = dayInIndia(now);
   const article = validateArticles(payload(draft(1)), 'world', sources, new Set(), 1)[0];
-  const document = makeDocument(article, 17, day, now, 'unused', plan, 1);
-  assert.equal(document._id, `tv10-newsroom-${day}-world-1`);
-  assert.equal(document.editorialStatus, 'published');
+  const document = makeDocument(article, 17, day, now, plan, 1);
+  assert.equal(document._id, `drafts.tv10-newsroom-${day}-world-1`);
+  assert.equal(document.editorialStatus, 'in-review');
   assert.equal(document.priority, 0);
   assert.equal(document.isBreaking, false);
   assert.deepEqual(document.author, { _type: 'reference', _ref: 'author-news-desk' });
   assert.ok(!('webPriority' in document));
   assert.ok(!('district' in document));
   assert.ok(!('mainImage' in document));
-  assert.equal(verifyPosts([document], day, plan).count, 1);
+  assert.equal(verifyPosts([document], day, plan).awaitingApproval, 1);
   assert.throws(() => verifyPosts([], day, plan), /Expected 1-18/);
-  assert.throws(() => verifyPosts([{ ...document, editorialStatus: 'approved' }], day, plan), /Missing approval/);
+  // Publishing is the editor's Approve & publish, never the run's.
+  assert.throws(() => verifyPosts([{ ...document, _id: `tv10-newsroom-${day}-world-1` }], day, plan), /draft awaiting approval/);
+  assert.throws(() => verifyPosts([{ ...document, editorialStatus: 'published' }], day, plan), /draft awaiting approval/);
   assert.throws(() => verifyPosts([{ ...document, author: undefined }], day, plan), /News Desk/);
 });
 
-test('Sanity reads and mocked publication use only the TV10 endpoint', async (context) => {
+test('Sanity reads and mocked draft writes use only the TV10 endpoint', async (context) => {
   let writes = 0;
   context.mock.method(globalThis, 'fetch', async (url, options) => {
     const parsed = new URL(url);
@@ -155,7 +159,7 @@ test('Sanity reads and mocked publication use only the TV10 endpoint', async (co
     if (options.method === 'POST') {
       writes++;
       assert.equal(parsed.pathname, '/v2024-01-01/data/mutate/production');
-      assert.deepEqual(JSON.parse(options.body), { mutations: [{ createIfNotExists: { _id: 'offline-test-document' } }] });
+      assert.deepEqual(JSON.parse(options.body), { mutations: [{ createIfNotExists: { _id: 'drafts.offline-test-document' } }] });
       return new Response('{}', { headers: { 'content-type': 'application/json' } });
     }
     assert.equal(parsed.pathname, '/v2024-01-01/data/query/production');
@@ -163,26 +167,8 @@ test('Sanity reads and mocked publication use only the TV10 endpoint', async (co
   });
   const client = sanityClient(configuration({ SANITY_API_TOKEN: 'offline-test-token' }));
   assert.deepEqual(await client.query('*[_type == "post"]'), []);
-  await client.publish([{ _id: 'offline-test-document' }]);
+  await assert.rejects(() => client.createDrafts([{ _id: 'drafts.offline-test-document' }, { _id: 'offline-test-document' }]), /drafts only/);
+  assert.equal(writes, 0);
+  await client.createDrafts([{ _id: 'drafts.offline-test-document' }]);
   assert.equal(writes, 1);
-});
-
-test('homepage verification respects pinned stories and checks new article pages separately', async (context) => {
-  const requests = [];
-  context.mock.method(globalThis, 'fetch', async (url) => {
-    const parsed = new URL(url);
-    assert.equal(parsed.hostname, 'www.tv10india.com');
-    requests.push(parsed.pathname);
-    const html = parsed.pathname === '/' ? '<a href="/news/pinned-story"><h1>Pinned story</h1></a>' : '<h1>New story</h1>';
-    return new Response(html, { headers: { 'content-type': 'text/html' } });
-  });
-  const client = { query: async (query) => {
-    assert.match(query, /editorialStatus == "published"/);
-    assert.match(query, /order\(coalesce\(priority, 0\) desc, publishedAt desc\)/);
-    return { slug: 'pinned-story' };
-  } };
-  const result = await verifyHomepage(client, [{ title: 'New story', slug: { current: 'new-story' } }]);
-  assert.equal(result.visibleBatchLinks, 0);
-  assert.equal(result.verifiedArticlePages, 1);
-  assert.deepEqual(requests, ['/', '/news/new-story']);
 });

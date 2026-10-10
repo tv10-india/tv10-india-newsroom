@@ -9,7 +9,6 @@ export const CATEGORIES = ['up', 'uk', 'delhi', 'world', 'dharma', 'business', '
 // these three may have a dry local feed topped up from the general-news pools.
 export const PLACE_CATEGORIES = new Set(['up', 'uk', 'delhi']);
 const SOURCE_DOMAINS = ['amarujala.com', 'bhaskar.com', 'abplive.com', 'bbc.co.uk', 'bbci.co.uk', 'bbc.com', 'sciencedaily.com', 'nasa.gov'];
-export const IMAGE_DOMAINS = ['upload.wikimedia.org', 'thumb.wikimedia.org'];
 export const hash = (text) => createHash('sha256').update(text).digest('hex').slice(0, 24);
 export const dayInIndia = (date = new Date()) => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
 export function batchPlan(count = 18, category = 'up') {
@@ -297,6 +296,51 @@ export function similarTitle(first, second, threshold = 0.7) {
   return shared / Math.min(left.size, right.size) >= threshold;
 }
 
+// Evidence is matched word for word: Unicode-normalized, case-folded, every punctuation
+// mark read as a space. ABP Live ends Hindi sentences with "." where Hindi writes "।", so
+// a quote that copied every word but ended a sentence the Hindi way failed an exact match;
+// one TV10 run lost six articles to evidence errors, every traceable one on an ABP source.
+// The words and their order must still match exactly, so paraphrase and translation fail.
+export const quoteWords = (text) => normalize(String(text ?? '').normalize('NFC')
+  .replace(/\p{Cf}/gu, '')
+  .replace(/[०-९]/g, (digit) => String(digit.codePointAt(0) - 0x0966))
+  .toLowerCase()
+  .replace(/[^\p{L}\p{M}\p{N}]+/gu, ' '));
+
+export function quoteMatches(sourceText, quote) {
+  if (typeof quote !== 'string') return false;
+  const length = characterCount(normalize(quote));
+  const words = quoteWords(quote);
+  // The word floor matters: an all-punctuation quote folds to "", which every text includes.
+  return length >= 30 && length <= 180 && characterCount(words) >= 20 && quoteWords(sourceText).includes(words);
+}
+
+// Why a quote failed, in terms the one correction can act on. Told only "not an exact
+// quote", all six of that run's evidence rejections failed again on correction.
+function quoteProblem(source, quote) {
+  if (typeof quote !== 'string' || !quote.trim()) return 'no evidence item names it';
+  const length = characterCount(normalize(quote));
+  if (length < 30 || length > 180) return `the quote is ${length} characters long`;
+  const words = quoteWords(quote);
+  if (characterCount(words) < 20) return 'the quote is mostly punctuation';
+  if (quoteWords(source.title).includes(words)) return 'it quotes the headline, which is not part of the supplied text';
+  // The longest opening run of the quote's words found in the source, ending on a whole
+  // word. Every shorter run of a found run is found too, so a binary search is enough.
+  const text = `${quoteWords(source.text)} `;
+  const parts = words.split(' ');
+  let low = 0;
+  let high = parts.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (text.includes(`${parts.slice(0, middle).join(' ')} `)) low = middle;
+    else high = middle - 1;
+  }
+  if (!low) return `its first word "${parts[0]}" does not appear in that source's text; evidence is never translated, and each quote must come from the source it names`;
+  const run = `${parts.slice(0, low).join(' ')} `;
+  const next = text.slice(text.indexOf(run) + run.length).split(' ')[0];
+  return `it follows the source for ${low} of its ${parts.length} words, then has "${parts[low]}" where ${next ? `the source has "${next}"` : 'the supplied text ends'}`;
+}
+
 export function validateArticles(payload, category, sources, alreadyUsed = new Set(), count = 2) {
   assert(CATEGORIES.includes(category), 'Invalid category');
   assert([1, 2].includes(count), 'Expected one or two articles per category');
@@ -351,7 +395,7 @@ export function validateArticles(payload, category, sources, alreadyUsed = new S
     }
     const visible = [article.title, article.district, ...article.tags, body].join(' ');
     if (/[a-z]/i.test(visible) || !/[\u0900-\u097f]/.test(visible)) {
-      errors.push(new ArticleStructureError(`${category}: article must use Devanagari, not Latin text. Rewrite Latin words in title, district, tags and block text in Devanagari. Keep slug, sourceIds, imageQueries and valid evidence quotes unchanged.`));
+      errors.push(new ArticleStructureError(`${category}: article must use Devanagari, not Latin text. Rewrite Latin words in title, district, tags and block text in Devanagari. Keep slug, sourceIds and valid evidence quotes unchanged.`));
     }
     assert(!/एजेंसी|हमारे संवाददाता|पीटीआई|एएनआई|अमर उजाला|दैनिक जागरण|दैनिक भास्कर|भास्कर|एबीपी|बीबीसी|एनडीटीवी/.test(visible), `${category}: outlet credit or byline in copy`);
     // Retryable and specific. "invalid source references" told us nothing when a model that
@@ -363,19 +407,19 @@ export function validateArticles(payload, category, sources, alreadyUsed = new S
       throw new ArticleStructureError(`${category}: sourceIds must be 1-3 distinct IDs, got ${article.sourceIds.length} (${new Set(article.sourceIds).size} distinct).`);
     }
     assert(Array.isArray(article.evidence), `${category}: missing evidence`);
+    const proven = new Set();
     for (const sourceId of article.sourceIds) {
       if (!sourceMap.has(sourceId)) {
         throw new ArticleStructureError(`${category}: sourceId ${sourceId} is not one of the supplied source records. Use the IDs exactly as supplied; do not invent or abbreviate them.`);
       }
       assert(!used.has(sourceId), `${category}: source ${sourceId} was already used by another article`);
-      const proof = article.evidence.find((item) => item?.sourceId === sourceId);
-      // Match on the normalized quote. extractArticle already collapsed the source's
-      // whitespace, so a model that re-wraps or double-spaces its excerpt is quoting
-      // correctly and must not lose the article over it. The substring match itself
-      // stays exact — that is what proves the article is grounded in the source.
-      const quote = normalize(typeof proof?.quote === 'string' ? proof.quote : '');
-      if (!(characterCount(quote) >= 30 && characterCount(quote) <= 180 && sourceMap.get(sourceId).text.includes(quote))) {
-        errors.push(new ArticleEvidenceError(`${category}: evidence for source ${sourceId} is not an exact quote from that source. Copy 30-180 characters straight out of that source's supplied text, unchanged.`));
+      // Any quote naming the source can prove it, not only the first; only quotes that
+      // match are kept, so the stored evidence is all verified.
+      const source = sourceMap.get(sourceId);
+      const quotes = article.evidence.filter((item) => item?.sourceId === sourceId);
+      for (const item of quotes) if (quoteMatches(source.text, item.quote)) proven.add(item);
+      if (!quotes.some((item) => proven.has(item))) {
+        errors.push(new ArticleEvidenceError(`${category}: evidence for source ${sourceId} is not an exact quote from that source: ${quoteProblem(source, quotes[0]?.quote)}. Copy 30-180 consecutive characters of that source's supplied text unchanged; do not translate, reword, or join separate sentences.`));
       }
       used.add(sourceId);
     }
@@ -383,9 +427,8 @@ export function validateArticles(payload, category, sources, alreadyUsed = new S
     if (errors.length > 1) throw new ArticleValidationError(errors);
     return {
       title: article.title, slug: article.slug, district: article.district, tags: article.tags,
-      imageQueries: Array.isArray(article.imageQueries) ? [...new Set(article.imageQueries.filter((query) => typeof query === 'string' && /^[a-zA-Z][a-zA-Z -]{2,59}$/.test(query) && query.trim().split(/\s+/).length <= 3).map(normalize))].slice(0, 3) : [],
       blocks: article.blocks.map(({ type, text }) => ({ type, text })), category,
-      sourceIds: article.sourceIds, evidence: article.evidence.filter((item) => article.sourceIds.includes(item?.sourceId)).map(({ sourceId, quote }) => ({ sourceId, quote })),
+      sourceIds: article.sourceIds, evidence: article.evidence.filter((item) => proven.has(item)).map(({ sourceId, quote }) => ({ sourceId, quote })),
       sources: article.sourceIds.map((sourceId) => {
         const { text: omitted, ...metadata } = sourceMap.get(sourceId);
         void omitted;
@@ -412,141 +455,6 @@ export function validateArticleCandidates(payload, category, sources, alreadyUse
   return { articles, failures };
 }
 
-// Licences we accept: CC0 and the public-domain mark only. The website has nowhere
-// to display a photo credit, so CC BY and CC BY-SA are deliberately excluded rather
-// than used without the attribution their deeds require.
-const CC_DEEDS = [
-  /^\/publicdomain\/zero\/1\.0(?:\/|$)/,
-  /^\/publicdomain\/mark\/1\.0(?:\/|$)/,
-];
-
-export function creditFreeLicense(value) {
-  try {
-    const url = new URL(value);
-    if (!['https:', 'http:'].includes(url.protocol)) return false;
-    if (url.hostname !== 'creativecommons.org' || url.username || url.password || url.port) return false;
-    return CC_DEEDS.some((deed) => deed.test(url.pathname));
-  } catch { return false; }
-}
-
-// True only for a file that may be republished with no credit line. Attribution,
-// NonCommercial and NoDerivatives deeds are absent from CC_DEEDS, so all are rejected.
-export function eligibleImage(info) {
-  const metadata = info.extmetadata ?? {};
-  if (!['image/jpeg', 'image/png', 'image/webp'].includes(info.mime) || !(info.width >= 800)) return false;
-  if (!['', 'false', '0'].includes(plainText(metadata.NonFree?.value).toLowerCase())) return false;
-  if (plainText(metadata.Restrictions?.value)) return false;
-  if (creditFreeLicense(plainText(metadata.LicenseUrl?.value))) return true;
-  return plainText(metadata.LicenseShortName?.value) === 'Public domain'
-    && plainText(metadata.Copyrighted?.value).toLowerCase() === 'false';
-}
-
-export function photoMatches(page, info, query) {
-  return photoScore(page, info, query) > 0;
-}
-
-// Crude suffix stripping, not linguistics: it only has to be consistent between the
-// query and the file metadata. Without it "kneaded" misses a title reading "Kneading",
-// and a photo of the actual subject loses to one that merely shares a literal token.
-const stem = (word) => {
-  const base = word.replace(/(?:ings?|edly|ed|ers?|es|s)$/, '').replace(/(.)\1$/, '$1');
-  return base.length >= 3 ? base : word;
-};
-
-// 0 means unusable. Above that, higher is a better subject match: a query term in the
-// file title is much stronger evidence than one that only shows up in the description,
-// so "Kneading Chapati Dough.jpg" outranks "Hand-held dough hook.jpg" for "kneaded dough".
-// A full title match scores 3; matching half the terms via description alone scores ~0.5.
-export function photoScore(page, info, query) {
-  const metadata = info.extmetadata ?? {};
-  const description = plainText(metadata.ImageDescription?.value);
-  const categories = plainText(metadata.Categories?.value);
-  const title = plainText(page.title).replace(/^File:/i, '').replace(/[_-]/g, ' ');
-  const context = `${title} ${description} ${categories}`;
-  if (/watermark|ai[ -]generated|artificial intelligence|stable diffusion|midjourney|dall[ -]?e|computer[ -]generated|screenshot|\blogos?\b|\bdiagrams?\b|illustration|\bpaintings?\b|\bdrawings?\b|\bmaps?\b|engraving|woodcut|lithograph|etching|\bsketch(?:es)?\b|pd-old/i.test(context)) return 0;
-  // Museum pieces score full marks on text — a Greek terracotta "figurine kneading
-  // dough" is a perfect term match for a story about storing dough, and a useless
-  // photo of it. Reject the artefact vocabulary outright.
-  if (/\bfigurines?\b|\bstatuettes?\b|\bstatues?\b|terracotta|\bsculptures?\b|\bcarvings?\b|\bamphora\b|\bpottery\b|\bartefacts?\b|\bartifacts?\b|\bbas[ -]relief\b|\bfrescoe?s?\b|\bmosaics?\b|\btapestr(?:y|ies)\b|\bmanuscripts?\b/i.test(context)) return 0;
-  // Historical prints and scanned book plates are public domain and score well on text,
-  // but a 1909 engraving is not a representative photo of a present-day subject.
-  const year = Number(plainText(metadata.DateTimeOriginal?.value).match(/\b([12][0-9]{3})\b/)?.[1]);
-  if (year && year < 1990) return 0;
-  const words = (value) => (value.toLowerCase().match(/[a-z]{3,}/g) ?? []).map(stem);
-  const terms = [...new Set(words(query))];
-  if (!terms.length) return 0;
-  const titleTerms = new Set(words(title));
-  const otherTerms = new Set([...words(description), ...words(categories)]);
-  const inTitle = terms.filter((term) => titleTerms.has(term));
-  const inOther = terms.filter((term) => !titleTerms.has(term) && otherTerms.has(term));
-  // The file title alone is often terse, so the description counts as subject
-  // evidence too, and half the query terms is enough to qualify at all.
-  if (inTitle.length + inOther.length < Math.max(1, Math.ceil(terms.length / 2))) return 0;
-  return (3 * inTitle.length + inOther.length) / terms.length;
-}
-
-export function imageContentType(bytes) {
-  if (bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return 'image/png';
-  if (bytes.length >= 3 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255) return 'image/jpeg';
-  if (bytes.length >= 12 && bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP') return 'image/webp';
-  throw new Error('Image has unsupported file signature');
-}
-
-// Provenance only. CC0 and public-domain photos need no credit, the published body
-// carries no image line, and the site never queries this — it lives in newsroom.image
-// so an audit can tell a keyword-matched stock photo from a photo of the event.
-export const IMAGE_CAPTION = 'प्रतीकात्मक तस्वीर';
-
-export async function findImage(query, fallbackQueries = []) {
-  assert(typeof query === 'string' && query.trim().length >= 3 && query.length <= 120, 'Invalid image query');
-  assert(Array.isArray(fallbackQueries) && fallbackQueries.length <= 2 && fallbackQueries.every((value) => typeof value === 'string' && value.trim().length >= 3 && value.length <= 120), 'Invalid image fallback queries');
-  const queries = [...new Set([query, ...fallbackQueries].map(normalize))];
-  let candidates = 0;
-  let weak = null;
-  for (const searchQuery of queries) {
-    const url = new URL('https://commons.wikimedia.org/w/api.php');
-    url.search = new URLSearchParams({
-      action: 'query', format: 'json', generator: 'search', gsrsearch: `${searchQuery} filetype:bitmap`,
-      gsrnamespace: '6', gsrlimit: '50', prop: 'imageinfo', iiprop: 'url|extmetadata|mime|size', iiurlwidth: '1280',
-    });
-    const result = await requestJson(url, { domains: ['commons.wikimedia.org'], label: 'Commons search' });
-    assert(!result.error, 'Commons search: API error; image search did not complete');
-    const pages = Object.values(result.query?.pages ?? {}).sort((first, second) => first.index - second.index);
-    candidates += pages.length;
-    let best = null;
-    for (const page of pages) {
-      const info = page.imageinfo?.[0];
-      if (!info) continue;
-      if (!eligibleImage(info)) continue;
-      const score = photoScore(page, info, searchQuery);
-      // Commons orders by its own text relevance, which happily puts an obscure tool
-      // above the actual subject. Rank the whole page and keep the best, rather than
-      // taking the first thing that clears the bar.
-      if (score > 0 && (!best || score > best.score)) best = { page, info, score };
-      if (best?.score >= 3) break;
-    }
-    if (!best) continue;
-    const { page, info } = best;
-    const download = safeUrl(info.thumburl ?? info.url, IMAGE_DOMAINS).href;
-    const match = {
-      kind: 'real-photo', title: page.title, download, pageUrl: safeUrl(info.descriptionurl, ['commons.wikimedia.org']).href,
-      // Licence and creator need no on-page credit under CC0 / public domain. They are
-      // kept as the provenance record in newsroom.image, not for publication.
-      license: plainText(info.extmetadata?.LicenseShortName?.value),
-      creator: plainText(info.extmetadata?.Artist?.value),
-      licenseUrl: plainText(info.extmetadata?.LicenseUrl?.value),
-      caption: IMAGE_CAPTION,
-      searchQuery, matchScore: Number(best.score.toFixed(2)),
-    };
-    // A weak best is worth one look at the next query, which is usually broader and
-    // may hold a squarely on-subject photo. Fall back to the weak one if it does not.
-    if (best.score >= 1.5 || searchQuery === queries[queries.length - 1]) return match;
-    weak ??= match;
-  }
-  if (weak) return weak;
-  throw new Error(`No credit-free CC0/public-domain image after ${queries.length} search(es), ${candidates} candidate(s); review or broaden the image queries`);
-}
-
 export function portableText(article) {
   return article.blocks.map((block, index) => ({
     _type: 'block', _key: `block-${index}`, style: block.type === 'heading' ? 'h3' : 'normal', markDefs: [],
@@ -556,21 +464,25 @@ export function portableText(article) {
 }
 
 // slot is the article's 1-based position within its own category. It defaults to the
-// even-spread assumption, but a caller publishing a partial batch must pass a real
+// even-spread assumption, but a caller writing a partial batch must pass a real
 // per-category counter so a short category does not shift every later article's ID.
-export function makeDocument(article, index, day, now, assetId, plan = batchPlan(), slot = index % plan.perCategory + 1) {
+// There is no mainImage: photos picked from Wikimedia Commons by keyword were too often
+// of the wrong subject, such as potato biscuits on a story about a cricket all-rounder.
+// Every post is a draft awaiting approval. A drafts. ID cannot be read without a token,
+// and the site shows only posts with the published status, so nothing reaches readers
+// until an editor uses Approve & publish in the Studio.
+export function makeDocument(article, index, day, now, plan = batchPlan(), slot = index % plan.perCategory + 1) {
   return {
-    _id: `${plan.prefix}-${day}-${article.category}-${slot}`, _type: 'post',
+    _id: `drafts.${plan.prefix}-${day}-${article.category}-${slot}`, _type: 'post',
     title: article.title, slug: { _type: 'slug', current: `${article.slug}-${article.sourceIds[0].slice(0, 8)}` },
     category: article.category, tags: article.tags, body: portableText(article),
-    ...(article.image ? { mainImage: { _type: 'image', asset: { _type: 'reference', _ref: assetId }, alt: article.title } } : {}),
-    editorialStatus: 'published', priority: 0, isBreaking: false,
+    editorialStatus: 'in-review', priority: 0, isBreaking: false,
     author: { _type: 'reference', _ref: 'author-news-desk' },
     publishedAt: new Date(now.getTime() - (plan.count - 1 - index) * 1000).toISOString(),
     // Every object in a Sanity array needs a _key. Without one the Studio replaces the
     // whole list with a "Missing keys" alert instead of showing the sources.
     newsroom: {
-      day, batchSize: plan.count, sourceIds: article.sourceIds, image: article.image,
+      day, batchSize: plan.count, sourceIds: article.sourceIds,
       sources: article.sources.map((source, position) => ({ _key: `source-${position}`, ...source })),
       evidence: article.evidence.map((item, position) => ({ _key: `evidence-${position}`, ...item })),
     },
@@ -578,26 +490,36 @@ export function makeDocument(article, index, day, now, assetId, plan = batchPlan
 }
 
 export function verifyPosts(posts, day, plan = batchPlan()) {
-  const expectedIds = new Set(postIds(day, plan));
+  const expectedIds = new Set(postIds(day, plan).map((id) => `drafts.${id}`));
   assert(posts.length >= plan.minimum && posts.length <= plan.count && new Set(posts.map((post) => post._id)).size === posts.length, `Expected ${plan.minimum}-${plan.count} distinct batch post(s), got ${posts.length}`);
   const lengths = [];
   const counts = Object.fromEntries(plan.categories.map((category) => [category, posts.filter((post) => post.category === category).length]));
   for (const category of plan.categories) assert(counts[category] <= plan.perCategory, `Expected at most ${plan.perCategory} post(s) in ${category}`);
   for (const post of posts) {
+    assert(post._id.startsWith('drafts.') && post.editorialStatus === 'in-review', 'Not a draft awaiting approval');
     assert(expectedIds.has(post._id), 'Unexpected batch post ID');
-    assert(post.editorialStatus === 'published', 'Missing approval');
-    if (post.mainImage !== undefined) assert(post.mainImage?.asset?._ref, 'Malformed image reference');
     assert(post.author?._type === 'reference' && post.author._ref === 'author-news-desk' && !('reporter' in post), 'Missing TV10 News Desk attribution');
     assert(post.priority === 0 && !('webPriority' in post) && post.isBreaking === false, 'Unexpected homepage priority');
     assert(typeof post.title === 'string' && post.title && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(post.slug?.current ?? ''), 'Missing headline or invalid slug');
     const timestamp = Date.parse(post.publishedAt);
-    assert(Number.isFinite(timestamp) && timestamp <= Date.now() && dayInIndia(new Date(timestamp)) === day, 'Invalid batch publication date');
+    assert(Number.isFinite(timestamp) && timestamp <= Date.now() && dayInIndia(new Date(timestamp)) === day, 'Invalid batch post date');
     const body = (post.body ?? []).map((block) => (block.children ?? []).map((span) => span.text ?? '').join('')).join('\n');
     const length = characterCount(body);
-    assert(length >= 1500 && length <= 2900, 'Invalid published body length');
+    assert(length >= 1500 && length <= 2900, 'Invalid body length');
     lengths.push(length);
   }
-  assert(new Set(posts.map((post) => post.slug.current)).size === posts.length, 'Duplicate published slug');
-  const withImages = posts.filter((post) => post.mainImage?.asset?._ref).length;
-  return { count: posts.length, requested: plan.count, shortfall: plan.count - posts.length, withImages, withoutImages: posts.length - withImages, approved: posts.length, bylines: posts.length, perCategory: counts, bodyLength: { min: Math.min(...lengths), max: Math.max(...lengths), average: Math.round(lengths.reduce((sum, length) => sum + length, 0) / lengths.length) } };
+  assert(new Set(posts.map((post) => post.slug.current)).size === posts.length, 'Duplicate slug');
+  return { count: posts.length, requested: plan.count, shortfall: plan.count - posts.length, awaitingApproval: posts.length, bylines: posts.length, perCategory: counts, bodyLength: { min: Math.min(...lengths), max: Math.max(...lengths), average: Math.round(lengths.reduce((sum, length) => sum + length, 0) / lengths.length) } };
+}
+
+// Where an earlier run's batch stands now. Editors approve, edit and delete these posts,
+// so a later run reports on them rather than verifying them: a strict check would treat
+// an editor's decision as a fault. Publishing moves a post from its drafts. ID to the
+// plain one, and editing a published post opens a new draft beside it; the published
+// copy is the one that counts.
+export function batchSummary(posts) {
+  const published = posts.filter((post) => !post._id.startsWith('drafts.'));
+  const publishedIds = new Set(published.map((post) => post._id));
+  const drafts = posts.filter((post) => post._id.startsWith('drafts.') && !publishedIds.has(post._id.slice('drafts.'.length)));
+  return { posts: [...published, ...drafts], published: published.length, drafts: drafts.length };
 }
