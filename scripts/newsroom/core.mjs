@@ -8,8 +8,18 @@ export const CATEGORIES = ['up', 'uk', 'delhi', 'world', 'dharma', 'business', '
 // up/uk/delhi, but rules general news out as a substitute under a topic category, so only
 // these three may have a dry local feed topped up from the general-news pools.
 export const PLACE_CATEGORIES = new Set(['up', 'uk', 'delhi']);
-const SOURCE_DOMAINS = ['amarujala.com', 'bhaskar.com', 'abplive.com', 'bbc.co.uk', 'bbci.co.uk', 'bbc.com', 'sciencedaily.com', 'nasa.gov'];
+// Publishers the newsroom may fetch from. README.md lists the Hindi outlets left out and why.
+const SOURCE_DOMAINS = ['amarujala.com', 'bhaskar.com', 'abplive.com', 'bbc.co.uk', 'bbci.co.uk', 'bbc.com', 'sciencedaily.com', 'nasa.gov',
+  'tv9hindi.com', 'indiatv.in', 'prabhatkhabar.com', 'hindi.moneycontrol.com', 'timesnowhindi.com'];
 export const hash = (text) => createHash('sha256').update(text).digest('hex').slice(0, 24);
+// TV10 India and Aaj Ka Sach run this same newsroom on the same feeds, and a source's ID is
+// the same hash in both, so left alone they pick the same articles: 69 pairs of posts, one
+// on each site, were written from one source article in the 14 days to 17 Oct 2026. Each
+// site therefore takes a fixed half of the source IDs and never fetches the other half.
+// sourceSite must stay identical in both repositories; only SITE and SISTER differ.
+export const SITE = 'tv10';
+export const SISTER = { site: 'aajkasach', name: 'Aaj Ka Sach', project: 'g1o8uwxq', dataset: 'production' };
+export const sourceSite = (id) => (parseInt(String(id).charAt(0), 16) < 8 ? 'aajkasach' : 'tv10');
 export const dayInIndia = (date = new Date()) => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
 export function batchPlan(count = 18, category = 'up') {
   assert([1, 18].includes(count), 'Article count must be 1 or 18');
@@ -64,16 +74,19 @@ export class ArticleRepeatError extends ArticleError {}
 // there is nothing to correct, so the runner re-asks the same question instead.
 export class GeminiResponseError extends Error {}
 
-export async function request(url, { domains, label, retries = 2, maxBytes = 3_000_000, ...options }) {
+// The newsroom names itself to every site it reads, and robots.txt is obeyed for that name.
+const USER_AGENT = 'TV10IndiaNewsroom/1.0 (https://www.tv10india.com)';
+
+export async function request(url, { domains, label, retries = 2, maxBytes = 3_000_000, timeout = 90_000, ...options }) {
   for (let attempt = 0; attempt <= retries; attempt++) {
     let current = safeUrl(url, domains);
     let response;
     try {
-      const signal = AbortSignal.timeout(90_000);
+      const signal = AbortSignal.timeout(timeout);
       for (let redirect = 0; redirect <= 4; redirect++) {
         response = await fetch(current, {
           ...options, signal, redirect: 'manual',
-          headers: { 'User-Agent': 'TV10IndiaNewsroom/1.0 (https://www.tv10india.com)', ...options.headers },
+          headers: { 'User-Agent': USER_AGENT, ...options.headers },
         });
         if (![301, 302, 303, 307, 308].includes(response.status)) break;
         await response.body?.cancel();
@@ -130,6 +143,68 @@ export async function requestJson(url, options) {
   const result = await request(url, options);
   try { return JSON.parse(result.bytes.toString('utf8')); }
   catch { throw new Error(`${options.label}: invalid JSON response`); }
+}
+
+// Publishers close parts of their sites to crawlers (TV9 shuts every path with /astrology/
+// in it, Prabhat Khabar every URL with a query string), and nothing stops their own feeds
+// linking there. So every feed and every article is checked against its site's robots.txt
+// (RFC 9309) before it is fetched. Each site's file is read once per run.
+const ROBOTS_AGENT = USER_AGENT.split('/')[0].toLowerCase();
+const robotsFiles = new Map();
+
+// * matches any run of characters and a closing $ anchors the end; all else is literal.
+function robotsPattern(value) {
+  const source = value.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+  return new RegExp(`^${source.endsWith('\\$') ? `${source.slice(0, -2)}$` : source}`);
+}
+
+export function parseRobots(text, agent = ROBOTS_AGENT) {
+  const groups = [];
+  let group = null;
+  let opening = false;
+  // \s also matches a byte-order mark, so a file that opens with one still parses.
+  for (const line of String(text).split(/\r\n|\r|\n/)) {
+    const [, key = '', value = ''] = line.replace(/#.*/, '').match(/^\s*([a-z-]+)\s*:\s*(.*?)\s*$/i) ?? [];
+    const field = key.toLowerCase();
+    if (field === 'user-agent') {
+      // Consecutive user-agent lines open one group together; the first rule ends the run.
+      if (!opening) groups.push(group = { agents: [], rules: [] });
+      group.agents.push(value.startsWith('*') ? '*' : (value.match(/^[\w-]+/)?.[0] ?? '').toLowerCase());
+      opening = true;
+    } else if (field === 'allow' || field === 'disallow') {
+      opening = false;
+      if (group && value) group.rules.push({ allow: field === 'allow', length: value.length, pattern: robotsPattern(value) });
+    }
+  }
+  // A group that names this agent replaces the * group; the two are never merged.
+  const named = groups.filter((item) => item.agents.includes(agent));
+  return (named.length ? named : groups.filter((item) => item.agents.includes('*'))).flatMap((item) => item.rules);
+}
+
+// The longest matching rule decides, and Allow wins a tie between rules of equal length.
+export function robotsAllows(rules, url) {
+  const { pathname, search } = new URL(url);
+  let best = null;
+  for (const rule of rules) {
+    if (rule.pattern.test(pathname + search) && (!best || rule.length > best.length || (rule.length === best.length && rule.allow))) best = rule;
+  }
+  return !best || best.allow;
+}
+
+export async function robotsAllowed(url) {
+  const { origin, hostname } = new URL(url);
+  if (!robotsFiles.has(origin)) {
+    robotsFiles.set(origin, request(`${origin}/robots.txt`, { domains: SOURCE_DOMAINS, label: `${hostname}/robots.txt`, retries: 1, timeout: 20_000, maxBytes: 512_000 }).then(
+      ({ bytes }) => parseRobots(bytes.toString('utf8')),
+      // A site with no robots.txt (any 4xx) closes nothing. One whose file cannot be read
+      // (5xx, 429, a timeout) counts as closed: the RFC's rule, and the polite one.
+      (error) => {
+        if (error.status >= 400 && error.status < 500 && error.status !== 429) return [];
+        throw new Error(`${error.message}; nothing on that site is fetched this run`);
+      },
+    ));
+  }
+  return robotsAllows(await robotsFiles.get(origin), url);
 }
 
 export function parseFeed(xml, now) {
@@ -221,6 +296,7 @@ export async function collectSources(feeds, now, warnings, excluded = new Set())
     const indexed = typeof feed !== 'string';
     const url = indexed ? feed.index : feed;
     try {
+      assert(await robotsAllowed(url), 'robots.txt does not allow this feed');
       const result = await request(url, { domains: SOURCE_DOMAINS, label: indexed ? 'Section index' : 'RSS feed', retries: 1 });
       const body = result.bytes.toString('utf8');
       const parsed = indexed
@@ -228,9 +304,13 @@ export async function collectSources(feeds, now, warnings, excluded = new Set())
         : parseFeed(body, now).sort((first, second) => second.publishedAt.localeCompare(first.publishedAt));
       const items = [];
       for (const source of parsed) {
-        if (seen.has(source.id)) continue;
+        // The sister site's half is dropped before anything is fetched, so every fetch
+        // slot below goes to a story this site may write.
+        if (seen.has(source.id) || sourceSite(source.id) !== SITE) continue;
         seen.add(source.id);
-        items.push(source);
+        // A feed can link into pages its own publisher closes to crawlers. Those are left
+        // out here, unfetched, rather than spending one of the fetch slots below.
+        if (await robotsAllowed(source.url)) items.push(source);
       }
       perFeed.push(items);
     } catch (error) { warnings.push(`Feed ${new URL(url).hostname}: ${error.message}`); }
@@ -397,7 +477,7 @@ export function validateArticles(payload, category, sources, alreadyUsed = new S
     if (/[a-z]/i.test(visible) || !/[\u0900-\u097f]/.test(visible)) {
       errors.push(new ArticleStructureError(`${category}: article must use Devanagari, not Latin text. Rewrite Latin words in title, district, tags and block text in Devanagari. Keep slug, sourceIds and valid evidence quotes unchanged.`));
     }
-    assert(!/एजेंसी|हमारे संवाददाता|पीटीआई|एएनआई|अमर उजाला|दैनिक जागरण|दैनिक भास्कर|भास्कर|एबीपी|बीबीसी|एनडीटीवी/.test(visible), `${category}: outlet credit or byline in copy`);
+    assert(!/एजेंसी|हमारे संवाददाता|पीटीआई|एएनआई|आईएएनएस|अमर उजाला|दैनिक जागरण|दैनिक भास्कर|भास्कर|एबीपी|बीबीसी|एनडीटीवी|इंडिया टीवी|टीवी ?[9९]|प्रभात खबर|मनीकंट्रोल|टाइम्स नाउ|नवभारत टाइम्स/.test(visible), `${category}: outlet credit or byline in copy`);
     // Retryable and specific. "invalid source references" told us nothing when a model that
     // had been handed only off-topic sources returned an article citing none of them.
     if (!Array.isArray(article.sourceIds) || !article.sourceIds.length) {

@@ -2,8 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import {
-  ArticleEvidenceError, ArticleLengthError, ArticleStructureError, ArticleValidationError, CATEGORIES, batchPlan, batchSummary, characterCount,
-  interleaveByRank, makeDocument, parseIndex, portableText, postIds, quoteMatches, similarTitle, validateArticleCandidates, validateArticles, verifyPosts,
+  ArticleEvidenceError, ArticleLengthError, ArticleStructureError, ArticleValidationError, CATEGORIES, SISTER, SITE, batchPlan, batchSummary, canonicalSource,
+  characterCount, collectSources, hash, interleaveByRank, makeDocument, parseIndex, parseRobots, portableText, postIds, quoteMatches, robotsAllowed,
+  robotsAllows, similarTitle, sourceSite, validateArticleCandidates, validateArticles, verifyPosts,
 } from './core.mjs';
 
 // Offline only: no network, no credentials. Run with `npm test`.
@@ -163,6 +164,9 @@ test('every category has at least one configured source and none is shared', () 
     for (const feed of feeds[category]) {
       const url = typeof feed === 'string' ? feed : feed.index;
       assert.ok(typeof url === 'string' && url.startsWith('https://'), `${category} has a malformed source entry`);
+      // A host outside the publisher list is refused at fetch time, so the feed would be
+      // skipped with a warning on every run instead of failing here.
+      assert.doesNotThrow(() => canonicalSource(url), `${url} is not on a permitted publisher's site`);
       // An index entry without a link pattern would match every anchor on the page,
       // including the section nav, and feed the model navigation chrome as evidence.
       if (typeof feed !== 'string') assert.ok(feed.links, `${category} index entry has no links pattern`);
@@ -212,6 +216,102 @@ test('a high-volume feed cannot starve a lower-volume feed on the same subject',
   assert.deepEqual(interleaveByRank([[], bhaskar, []], 10), bhaskar);
   assert.deepEqual(interleaveByRank([], 10), []);
   assert.equal(interleaveByRank([bbc], 6).length, 6);
+});
+
+test('the two sites take fixed halves of every feed, the same halves in both repositories', () => {
+  // Aaj Ka Sach's copy of this test pins the same vectors. Were the hash or the split to
+  // change in one repository alone, the two sites would start writing from the same
+  // source articles again, so the halves are pinned here rather than recomputed.
+  assert.equal(SITE, 'tv10');
+  assert.deepEqual(SISTER, { site: 'aajkasach', name: 'Aaj Ka Sach', project: 'g1o8uwxq', dataset: 'production' });
+  assert.deepEqual(['0', '7', '8', 'f'].map((digit) => sourceSite(digit.padEnd(24, '0'))), ['aajkasach', 'aajkasach', 'tv10', 'tv10']);
+  for (const [url, id, site] of [
+    ['https://www.bhaskar.com/local/uttar-pradesh/lucknow/news/metro-corridor-approved-136001.html', 'e436c177309dcf7e24ddce4c', 'tv10'],
+    ['https://www.bhaskar.com/local/uttar-pradesh/lucknow/news/metro-corridor-approved-136002.html', '72d2d12ca268d75af7aded26', 'aajkasach'],
+    ['https://www.amarujala.com/uttarakhand/dehradun/science-festival-2026-10-09', 'a5ae1726084a2c8e4be6417c', 'tv10'],
+    ['https://www.amarujala.com/uttarakhand/dehradun/science-festival-2026-10-10', '294033879a0cedef34bb7fa9', 'aajkasach'],
+    ['https://www.abplive.com/lifestyle/diwali-sweets-at-home-3012345', '37e24b3c4435e2295bd197c1', 'aajkasach'],
+    ['https://www.abplive.com/lifestyle/diwali-sweets-at-home-3012346', 'bc103f2c6cfef26d53780e87', 'tv10'],
+    ['https://www.bbc.com/sport/cricket/articles/c0000000001o', '1d294a655c405c2bfe5af136', 'aajkasach'],
+    ['https://www.bbc.com/sport/cricket/articles/c0000000002o', 'a44e4e17681ebb59ddf4c282', 'tv10'],
+  ]) {
+    assert.equal(hash(canonicalSource(url)), id);
+    // A tracking-tagged link to the same story lands on the same site.
+    assert.equal(hash(canonicalSource(`${url}?utm_source=rss&utm_medium=feed#top`)), id);
+    assert.equal(sourceSite(id), site);
+  }
+});
+
+const robots = (text, path) => robotsAllows(parseRobots(text), `https://www.tv9hindi.com${path}`);
+
+test('robots.txt is read as RFC 9309 reads it', () => {
+  // The two rules that made the check necessary, as TV9 and Prabhat Khabar publish them.
+  const tv9 = 'User-agent: *\nDisallow: */astrology/*\n';
+  assert.equal(robots(tv9, '/religion/astrology/rashifal-17-october-2026-3534001.html'), false);
+  assert.equal(robots(tv9, '/religion/navratri-kanya-pujan-vidhi-3534002.html'), true);
+  const prabhatKhabar = 'User-agent: *\nDisallow: /*?*\n';
+  assert.equal(robots(prabhatKhabar, '/national/story-123?ref=home'), false);
+  assert.equal(robots(prabhatKhabar, '/national/story-123'), true);
+  // The longest matching rule decides, Allow wins a tie, and a closing $ anchors the end.
+  const nested = 'User-agent: *\nDisallow: /a\nAllow: /a/b\nDisallow: /a/b/c\nAllow: /x\nDisallow: /x\nDisallow: /*.pdf$\n';
+  assert.deepEqual(['/a/z', '/a/b/z', '/a/b/c/z', '/x', '/files/a.pdf', '/files/a.pdf?download=1'].map((path) => robots(nested, path)), [false, true, false, true, false, true]);
+  // Comments, letter case, CRLF line ends and a byte-order mark change nothing.
+  assert.equal(robots('\uFEFFuser-AGENT: *   # everyone\r\nDISALLOW: /private/ # note\r\n', '/private/page'), false);
+  // No group for this crawler and no * group: nothing is closed.
+  assert.equal(robots('User-agent: OtherBot\nDisallow: /\n', '/news/page'), true);
+});
+
+test('a robots.txt group naming the newsroom replaces the * group instead of joining it', () => {
+  const named = 'User-agent: *\nDisallow: /\n\nUser-agent: TV10IndiaNewsroom\nAllow: /news/\nDisallow: /news/private/\n';
+  assert.deepEqual(['/news/a', '/news/private/a', '/other'].map((path) => robots(named, path)), [true, false, true]);
+  // The name matches with a version, in any letter case, and as one of several user-agent lines.
+  assert.equal(robots('User-agent: tv10indianewsroom/1.0\nDisallow: /\n', '/news/a'), false);
+  const shared = 'User-agent: OtherBot\nUser-agent: TV10IndiaNewsroom\nDisallow: /shared/\n\nUser-agent: *\nDisallow: /\n';
+  assert.deepEqual(['/shared/a', '/elsewhere'].map((path) => robots(shared, path)), [false, true]);
+  // An empty Disallow closes nothing but still ends the group, so the next user-agent line
+  // opens a group of its own rather than lending its rules to this one.
+  assert.equal(robots('User-agent: TV10IndiaNewsroom\nDisallow:\nUser-agent: OtherBot\nDisallow: /\n', '/news/a'), true);
+});
+
+test('a site with no robots.txt closes nothing, and one whose file cannot be read closes everything', async (context) => {
+  context.mock.method(globalThis, 'fetch', async (url) => {
+    if (new URL(url).hostname === 'missing.amarujala.com') return new Response('Not found', { status: 404 });
+    throw new TypeError('fetch failed');
+  });
+  assert.equal(await robotsAllowed('https://missing.amarujala.com/news/page.html'), true);
+  await assert.rejects(() => robotsAllowed('https://down.amarujala.com/news/page.html'), /network failure or timeout; nothing on that site is fetched this run/);
+});
+
+test('a site fetches only its own half of a feed, and only what robots.txt leaves open', async (context) => {
+  const now = new Date('2026-10-17T06:00:00Z');
+  // Sixteen stories, newest first: eight in an open section, eight in one robots.txt
+  // closes. Each site owns some of both.
+  const stories = Array.from({ length: 16 }, (unused, n) => `https://split.abplive.com/${n < 8 ? 'news' : 'blocked'}/offline-test-story-${n}`);
+  const feed = `<?xml version="1.0"?><rss><channel>${stories.map((url, n) => `<item><title>खबर ${n}</title><link>${url}</link><pubDate>${new Date(now.getTime() - (n + 1) * 60_000).toUTCString()}</pubDate></item>`).join('')}</channel></rss>`;
+  const fetched = [];
+  const agents = new Set();
+  context.mock.method(globalThis, 'fetch', async (url, options) => {
+    const { hostname, pathname, href } = new URL(url);
+    fetched.push(href);
+    agents.add(options.headers['User-Agent']);
+    if (pathname === '/robots.txt') return new Response(hostname.startsWith('closed.') ? 'User-agent: *\nDisallow: /rss/\n' : 'User-agent: *\nDisallow: /blocked/\n');
+    if (href === 'https://split.abplive.com/feed') return new Response(feed);
+    if (stories.includes(href)) return new Response(`<html><body><article><p>${'क'.repeat(1300)}</p></article></body></html>`);
+    return new Response('Not found', { status: 404 });
+  });
+  const warnings = [];
+  const sources = await collectSources(['https://closed.bhaskar.com/rss/feed.xml', 'https://split.abplive.com/feed'], now, warnings);
+  const mine = stories.filter((url) => sourceSite(hash(url)) === SITE);
+  const open = mine.filter((url) => url.includes('/news/'));
+  assert.ok(open.length && open.length < mine.length && mine.length < stories.length, 'the fixture must cover both sites and both sections');
+  assert.deepEqual(sources.map((source) => source.url), open);
+  // Nothing of the other site's, and nothing behind the robots rule, was ever requested.
+  assert.deepEqual(fetched.filter((url) => stories.includes(url)), open);
+  assert.deepEqual(warnings, ['Feed closed.bhaskar.com: robots.txt does not allow this feed']);
+  assert.deepEqual(fetched.filter((url) => url.startsWith('https://closed.')), ['https://closed.bhaskar.com/robots.txt']);
+  assert.equal(fetched.filter((url) => url === 'https://split.abplive.com/robots.txt').length, 1);
+  // Every request names the newsroom honestly; that name is the one robots.txt is read for.
+  assert.deepEqual([...agents], ['TV10IndiaNewsroom/1.0 (https://www.tv10india.com)']);
 });
 
 const SOURCE_ID = 'abcdef0123456789abcdef01';

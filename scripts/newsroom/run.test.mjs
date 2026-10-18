@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { configuration, generateValidatedCategory, sanityClient } from './run.mjs';
+import { configuration, generateValidatedCategory, recentlyUsed, sanityClient, sisterPosts } from './run.mjs';
 import { QuotaError, batchPlan, dayInIndia, makeDocument, validateArticles, verifyPosts } from './core.mjs';
 
 const quote = 'This source text contains an exact excerpt used only in offline tests.';
@@ -171,4 +171,46 @@ test('Sanity reads and mocked draft writes use only the TV10 endpoint', async (c
   assert.equal(writes, 0);
   await client.createDrafts([{ _id: 'drafts.offline-test-document' }]);
   assert.equal(writes, 1);
+});
+
+test('the sister site is read from its public CDN without a token, and only read', async (context) => {
+  const since = '2026-10-03T06:00:00.000Z';
+  const posts = [{ title: 'दूसरी साइट का शीर्षक', sourceIds: ['0abcdef0123456789abcdef0'] }];
+  let reads = 0;
+  context.mock.method(globalThis, 'fetch', async (url, options) => {
+    const parsed = new URL(url);
+    assert.equal(parsed.hostname, 'g1o8uwxq.apicdn.sanity.io');
+    assert.equal(parsed.pathname, '/v2021-06-07/data/query/production');
+    assert.equal(parsed.searchParams.get('$since'), JSON.stringify(since));
+    assert.match(parsed.searchParams.get('query'), /^\*\[_type == "post" && publishedAt >= \$since\]/);
+    // A GET with no body and no credentials: neither site holds a key to the other.
+    assert.ok(!options.method || options.method === 'GET');
+    assert.equal(options.body, undefined);
+    assert.deepEqual(Object.keys(options.headers), ['User-Agent']);
+    reads++;
+    return new Response(JSON.stringify({ result: reads === 1 ? posts : null }), { headers: { 'content-type': 'application/json' } });
+  });
+  assert.deepEqual(await sisterPosts(since), posts);
+  await assert.rejects(() => sisterPosts(since), /Aaj Ka Sach query failed/);
+});
+
+test('recent headlines from both sites are carried within their caps, and every source is kept', () => {
+  const post = (site, index) => ({ title: `${site} शीर्षक ${index}`, sourceIds: [`${site}-${index}`] });
+  const own = Array.from({ length: 130 }, (unused, index) => post('own', index));
+  // A published post with unpublished edits comes back twice, once as its draft.
+  own.splice(1, 0, structuredClone(own[0]));
+  const sister = [
+    // A headline both sites carry counts as this site's, and a post may lack either field.
+    { title: own[2].title, sourceIds: null }, { title: null, sourceIds: ['sister-x'] },
+    ...Array.from({ length: 70 }, (unused, index) => post('sister', index)),
+  ];
+  const { used, alreadyUsed, sisterTitles } = recentlyUsed(own, sister);
+  assert.deepEqual(alreadyUsed, [
+    ...Array.from({ length: 120 }, (unused, index) => `own शीर्षक ${index}`),
+    ...Array.from({ length: 60 }, (unused, index) => `sister शीर्षक ${index}`),
+  ]);
+  assert.deepEqual([...sisterTitles], alreadyUsed.slice(120));
+  assert.equal(used.size, 130 + 70 + 1);
+  assert.ok(used.has('own-129') && used.has('sister-69') && used.has('sister-x'));
+  assert.deepEqual(recentlyUsed([]), { used: new Set(), alreadyUsed: [], sisterTitles: new Set() });
 });

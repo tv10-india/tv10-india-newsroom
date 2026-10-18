@@ -3,7 +3,7 @@ import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
-  CATEGORIES, PLACE_CATEGORIES, QuotaError, ArticleStructureError, ArticleLengthError, ArticleEvidenceError, ArticleValidationError, GeminiResponseError, assert, batchPlan, batchSummary, characterCount, collectSources, dayInIndia, makeDocument,
+  CATEGORIES, PLACE_CATEGORIES, QuotaError, ArticleStructureError, ArticleLengthError, ArticleEvidenceError, ArticleValidationError, GeminiResponseError, SISTER, assert, batchPlan, batchSummary, characterCount, collectSources, dayInIndia, makeDocument,
   postIds, requestJson, similarTitle, validateArticleCandidates, verifyPosts,
 } from './core.mjs';
 
@@ -54,6 +54,36 @@ export function sanityClient(config) {
       });
     },
   };
+}
+
+// Every post of the last fortnight, newest first: its headline and the sources behind it.
+const RECENT_POSTS = '*[_type == "post" && publishedAt >= $since] | order(publishedAt desc){title,"sourceIds":newsroom.sourceIds}';
+
+// The sister site's posts, so a story it has already run from one outlet's report is not
+// written again here from another's. Read-only: a GET to the public CDN with no token,
+// which is also why it sees published posts only. Drafts still waiting for approval on
+// the other site are invisible, so two same-day drafts can still cover one event; the
+// source split in core.mjs is what keeps the two sites off the same source article.
+export async function sisterPosts(since) {
+  const host = `${SISTER.project}.apicdn.sanity.io`;
+  const url = new URL(`https://${host}/v2021-06-07/data/query/${SISTER.dataset}`);
+  url.searchParams.set('query', RECENT_POSTS);
+  url.searchParams.set('$since', JSON.stringify(since));
+  const result = await requestJson(url, { domains: [host], label: `${SISTER.name} query`, retries: 1, timeout: 30_000 });
+  assert(!result.error && Array.isArray(result.result), `${SISTER.name} query failed`);
+  return result.result;
+}
+
+// Every source ID is kept (short strings, exact matching), the sister site's included: its
+// posts from before the split may have drawn on this site's half. The titles go into the
+// prompt, so only this site's newest 120 and the sister site's newest 60 are carried to
+// keep the request size sane. A published post with unpublished edits is there twice,
+// once as its draft, hence the Set.
+export function recentlyUsed(recent, sister = []) {
+  const titles = (posts) => [...new Set(posts.map((post) => post.title).filter((title) => typeof title === 'string'))];
+  const own = titles(recent).slice(0, 120);
+  const sisterTitles = titles(sister).filter((title) => !own.includes(title)).slice(0, 60);
+  return { used: new Set([...recent, ...sister].flatMap((post) => post.sourceIds ?? [])), alreadyUsed: [...own, ...sisterTitles], sisterTitles: new Set(sisterTitles) };
 }
 
 function articleResponseSchema(count) {
@@ -174,7 +204,8 @@ export async function generateValidatedCategory({ config, prompt, category, sour
 function reportMarkdown(report) {
   const safe = (value) => String(value).replace(/[\r\n|<>]/g, ' ');
   const lines = [
-    '# Newsroom run', '', `Date (IST): ${report.day}`, `Mode: ${report.mode}`, `Requested articles: ${report.requestedCount}`, `Validated articles: ${report.articles.length}`, `Categories: ${report.categories.join(', ')}`, `Status: ${report.status}`, '',
+    '# Newsroom run', '', `Date (IST): ${report.day}`, `Mode: ${report.mode}`, `Requested articles: ${report.requestedCount}`, `Validated articles: ${report.articles.length}`, `Categories: ${report.categories.join(', ')}`, `Status: ${report.status}`,
+    `Sister site: ${report.sister ? `${report.sister.name}, ${report.sister.posts} published post(s) from the last 14 days checked for repeats` : 'not checked'}. Feed items are split between the two sites by source ID.`, '',
     'Posts are written to Sanity as drafts awaiting approval. None reaches the website until an editor uses Approve & publish in the Studio. Automated checks do not establish factual accuracy.', '',
     '| Category | Headline | Post date (UTC) |', '| --- | --- | --- |',
     ...report.articles.map((article) => `| ${safe(article.category)} | ${safe(article.title)} | ${safe(article.publishedAt ?? 'not written')} |`),
@@ -241,8 +272,20 @@ export async function main(args = process.argv.slice(2)) {
     // repeat of the same URL was never possible past 72 hours anyway; the long window
     // exists for headlines — the same story picked up later by a different outlet.
     // Drafts count too, so a story still waiting for approval is not written twice.
-    const recent = await client.query('*[_type == "post" && publishedAt >= $since] | order(publishedAt desc){title,"sourceIds":newsroom.sourceIds}', { since: new Date(now.getTime() - 14 * 24 * 3600000).toISOString() });
-    const used = new Set(recent.flatMap((post) => post.sourceIds ?? []));
+    const since = new Date(now.getTime() - 14 * 24 * 3600000).toISOString();
+    const recent = await client.query(RECENT_POSTS, { since });
+    // A sister site that cannot be read costs this run its headline check, not the run:
+    // the source split alone keeps the two sites off the same source article.
+    let sister = [];
+    try {
+      sister = await sisterPosts(since);
+      report.sister = { name: SISTER.name, posts: sister.length };
+    } catch (error) {
+      const warning = `${SISTER.name}: recent posts could not be read (${error.message}); its headlines are not checked this run, but the source split still keeps the two sites off the same source articles`;
+      report.warnings.push(warning);
+      console.warn(warning);
+    }
+    const { used, alreadyUsed, sisterTitles } = recentlyUsed(recent, sister);
     const prompt = await readFile(new URL('./editorial-prompt.md', import.meta.url), 'utf8');
     const pools = {};
     const feedCategories = [...new Set([...plan.categories, 'national'])];
@@ -251,10 +294,6 @@ export async function main(args = process.argv.slice(2)) {
       pools[category] = await collectSources(feeds[category], now, report.warnings, used);
     }
     let lastRequest = 0;
-    // Every source ID is kept (short strings, exact matching), but the titles go into the
-    // prompt, so only the newest 120 are carried to keep the request size sane. A published
-    // post with unpublished edits is there twice, once as its draft, hence the Set.
-    const alreadyUsed = [...new Set(recent.map((post) => post.title).filter((title) => typeof title === 'string'))].slice(0, 120);
     for (const category of plan.categories) {
       try {
         const local = pools[category].filter((source) => !used.has(source.id));
@@ -271,10 +310,14 @@ export async function main(args = process.argv.slice(2)) {
           : [...(pools.national ?? []), ...(pools.world ?? [])].filter((source) => !used.has(source.id));
         if (fallback.length) report.warnings.push(`${category}: only ${local.length} on-topic source(s); topped up from general news`);
         const sources = [...new Map([...local, ...fallback].map((source) => [source.id, source])).values()].slice(0, 8);
-        assert(sources.length >= plan.perCategory, `${category}: insufficient recent, readable sources (${local.length} on-topic${PLACE_CATEGORIES.has(category) ? `, ${fallback.length} general-news fallback` : '; topic categories take no general-news fallback'})`);
+        assert(sources.length, `${category}: insufficient recent, readable sources (${local.length} on-topic${PLACE_CATEGORIES.has(category) ? `, ${fallback.length} general-news fallback` : '; topic categories take no general-news fallback'})`);
+        // A source backs one article at most, and this site reads only its half of every
+        // feed, so a thin day can leave a single source. Ask for one article then, not none.
+        const count = Math.min(plan.perCategory, sources.length);
+        if (count < plan.perCategory) report.warnings.push(`${category}: only ${sources.length} usable source(s), so asking for ${count} article(s) instead of ${plan.perCategory}`);
         console.log(`Generating and validating: ${category}`);
         const articles = await generateValidatedCategory({
-          config, prompt, category, sources, alreadyUsed, used, count: plan.perCategory,
+          config, prompt, category, sources, alreadyUsed, used, count,
           beforeRequest: async () => {
             await sleep(Math.max(0, config.interval - (Date.now() - lastRequest)));
             lastRequest = Date.now();
@@ -286,13 +329,13 @@ export async function main(args = process.argv.slice(2)) {
           },
         });
         assert(articles.length, `${category}: no articles passed validation`);
-        // Drop near-duplicates of anything already in Sanity or generated earlier in this
-        // batch, rather than failing the category: one repeated story should not also cost
-        // the fresh article next to it.
+        // Drop near-duplicates of anything already on either site or generated earlier in
+        // this batch, rather than failing the category: one repeated story should not also
+        // cost the fresh article next to it.
         const fresh = articles.filter((article) => {
           const clash = alreadyUsed.find((title) => similarTitle(title, article.title));
           if (clash) {
-            report.warnings.push(`${category}: skipped "${article.title}" as a repeat of "${clash}"`);
+            report.warnings.push(`${category}: skipped "${article.title}" as a repeat of ${sisterTitles.has(clash) ? `${SISTER.name}'s ` : ''}"${clash}"`);
             // Burn the sources too, so a later category cannot pick the same story up again.
             article.sourceIds.forEach((sourceId) => used.add(sourceId));
           }

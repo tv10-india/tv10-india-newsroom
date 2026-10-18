@@ -18,6 +18,8 @@ substitute: politics, elections, electoral rolls, courts and administration do n
 belong under lifestyle. Prefer returning fewer articles, explained in skipped, over an
 article that does not fit the requested category.
 Do not retell the same event twice, including events in the supplied alreadyUsed list.
+alreadyUsed also holds headlines recently published by a sister news site. A story it
+has already run is not news here either, even when your source is a different outlet.
 A follow-up, an update, or a differently worded version of a headline in alreadyUsed
 counts as the same event; the runner rejects it and that article slot is lost.
 If the requested number of well-supported suitable stories is unavailable, return fewer articles and
@@ -34,8 +36,9 @@ inside a paragraph is not a heading block. Target 410-470 characters per paragra
 and 2,100-2,500 characters across the complete body, including headings and separators,
 using only supported facts. Do not output a two-block outline or placeholders.
 Use fluent Devanagari Hindi; no Latin letters in headlines, body, district, or tags.
-No byline or news outlet/agency name in article text; no PTI, ANI, एजेंसी,
-हमारे संवाददाता, or outlet credits such as दैनिक भास्कर, अमर उजाला, एबीपी, or बीबीसी.
+No byline or news outlet/agency name in article text; no PTI, ANI, IANS, एजेंसी,
+हमारे संवाददाता, or outlet credits such as दैनिक भास्कर, अमर उजाला, एबीपी, बीबीसी,
+इंडिया टीवी, टीवी9, प्रभात खबर, मनीकंट्रोल, or टाइम्स नाउ.
 Preserve source URLs only in the sourceIds
 references supplied separately. Source attribution is stored in internal metadata.
 Write original text, not translations copied sentence-for-sentence from a publisher.
