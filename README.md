@@ -23,7 +23,9 @@ environment files. No website files need changing.
   Drafts carry `priority: 0`, `isBreaking: false`, and TV10's existing
   `author-news-desk` reference. It does not invent a named author.
 - Pins the destination to project `uh81euwc`, dataset `production`; another site's
-  project ID is rejected. It never modifies Aaj Ka Sach's project or local files.
+  project ID is rejected. It never modifies Aaj Ka Sach's project or local files. It
+  does read Aaj Ka Sach's published headlines, without a token, so that the two sites
+  do not run the same stories (see [Two sites, different news](#two-sites-different-news)).
 - Uses independent `drafts.tv10-newsroom-...` document IDs. If a batch already
   exists for that IST day, a rerun only reports how many of its posts are published
   and how many are still drafts; it writes nothing. A partial batch is not topped up
@@ -138,10 +140,102 @@ are not a guarantee; use a manual run for immediate testing. If both websites us
 the same Gemini key and encounter quota errors, stagger their schedules rather
 than repeatedly rerunning failed batches.
 
+## Two sites, different news
+
+TV10 India and Aaj Ka Sach run this same newsroom on the same feeds. Left alone they
+pick the same stories: in the 14 days to 17 Oct 2026, 69 pairs of posts, one on each
+site, were written from the same source article. Two rules keep them apart.
+
+- **Each source article belongs to one site.** A source's ID is a hash of its address,
+  with tracking tags removed. IDs starting `0`-`7` belong to Aaj Ka Sach, `8`-`f` to
+  TV10 India. Both sites read every feed, but each fetches and writes from its own half
+  only, so the two never write from the same article. The rule (`sourceSite` in
+  `core.mjs`) must stay identical in both repositories, and a test in each pins it.
+- **Each site checks the other's headlines.** Before writing, the runner reads Aaj Ka
+  Sach's posts from the last 14 days from its public Sanity CDN (project `g1o8uwxq`).
+  This is a plain read: no token is sent, and nothing is ever written there. The newest
+  60 of its headlines join this site's own in `alreadyUsed`, so the model is told not to
+  retell them, and a generated headline too close to one of them is dropped with a
+  warning. Its source IDs count as used. `report.md` says how many of its posts were
+  checked. If the read fails, the run carries on with a warning; the split still holds.
+
+What this cannot catch: the public CDN shows published posts only, so drafts still
+waiting for approval on the other site are invisible. Both sites can therefore write
+same-day drafts about one event from two outlets' reports. Check the other site before
+approving a story that looks familiar.
+
+The split works only once both repositories run it, so upload the update to both.
+Each site now has half as many candidate stories per feed, which is why the feed list
+below was widened. If a category is left with a single usable source, the runner asks
+for one article instead of two and says so in the report.
+
+## Where the stories come from
+
+[`feeds.json`](./scripts/newsroom/feeds.json) lists 54 feeds from nine publishers. Aaj
+Ka Sach's copy is the same except that it calls the `national` category `others`.
+
+| Category | Publishers |
+| --- | --- |
+| `up` | Dainik Bhaskar, Amar Ujala, TV9 Bharatvarsh, India TV, ABP Live |
+| `uk` | Dainik Bhaskar (its Uttarakhand section page, as it has no feed), Amar Ujala, TV9 Bharatvarsh |
+| `delhi` | ABP Live (two feeds), Dainik Bhaskar, TV9 Bharatvarsh, India TV |
+| `world` | Dainik Bhaskar, BBC News (English), TV9 Bharatvarsh, India TV, ABP Live, Prabhat Khabar, Moneycontrol Hindi |
+| `dharma` | ABP Live, Amar Ujala, TV9 Bharatvarsh, Prabhat Khabar, India TV |
+| `business` | Dainik Bhaskar, ABP Live, TV9 Bharatvarsh, India TV, Moneycontrol Hindi, Prabhat Khabar |
+| `sports` | Dainik Bhaskar, BBC Sport (English), TV9 Bharatvarsh, India TV, ABP Live, Prabhat Khabar, Moneycontrol Hindi |
+| `national` | Dainik Bhaskar, ABP Live (two feeds), TV9 Bharatvarsh, India TV, Prabhat Khabar, BBC Hindi, Moneycontrol Hindi, Times Now Navbharat |
+| `lifestyle` | ABP Live (two feeds), TV9 Bharatvarsh, India TV (two feeds), Prabhat Khabar (two feeds) |
+
+**robots.txt is obeyed.** Before a feed or an article is fetched, the runner reads that
+site's `robots.txt` (once per site per run) and skips anything it closes, following
+the standard search engines use (RFC 9309). TV9, for example, closes every address
+containing `/astrology/` and Prabhat Khabar every address with a query string, and
+nothing stops their own feeds linking to such pages. The newsroom names itself as
+`TV10IndiaNewsroom/1.0`, so a site can address it by that name. A site with no
+`robots.txt` closes nothing; a site whose file cannot be read (a server error or a
+timeout) is skipped for that run, and the report shows a `Feed …` warning.
+
+Bhaskar, BBC and Moneycontrol close their sites to named AI crawlers, GPTBot and
+Google-Extended among them. Those rules name other crawlers, not this newsroom, so
+they do not apply to it; whether to keep using those publishers is an editorial call.
+
+Hindi outlets left out, as checked on 17 Oct 2026 with the newsroom's own name:
+
+| Outlet | Why |
+| --- | --- |
+| Live Hindustan | Its feed server's `robots.txt` closes everything (`Disallow: /`). |
+| Oneindia Hindi | `robots.txt` closes everything, and the site refuses the newsroom (HTTP 403). |
+| Patrika | `robots.txt` closes `*/blog/*`, and every Patrika feed is under it. |
+| ETV Bharat | `robots.txt` closes its Hindi news sections. |
+| News18 Hindi, NDTV India | They refuse the newsroom (HTTP 403). |
+| Dainik Jagran, Navbharat Times | Their feeds are gone or empty. |
+| Zee News, Zee Business, Punjab Kesari, Webdunia | No usable feed. |
+| Jansatta | Its feeds carry XML `DOCTYPE` declarations, which the feed reader refuses for safety. |
+| DW Hindi | Feed empty. |
+| Aaj Tak | Only a home feed, mostly videos and horoscopes. |
+| Amar Ujala Delhi | Behind a paywall. Amar Ujala's other feeds are used. |
+
+Duplicate feeds were left out too. ABP Live's `lifestyle/religion`, `health` and
+`photo-gallery/lifestyle` feeds carry exactly the items of its `religion`,
+`lifestyle/health` and `lifestyle` feeds (the last was in the old list and has been
+removed), and every item in BBC Hindi's international feed is also in its main feed.
+
+The feed list and [editorial instructions](./scripts/newsroom/editorial-prompt.md)
+are editable. If you add a feed on a new host, add its trusted domain to
+`SOURCE_DOMAINS` in [core.mjs](./scripts/newsroom/core.mjs); a test fails until you
+do. Add the feed to Aaj Ka Sach's `feeds.json` as well: each site writes from only
+its half of a feed, so a feed that only one site reads leaves the other half unused.
+
 ## Failure diagnostics
 
 - `0 validated`: inspect the per-article warnings. Nothing was written to Sanity.
 - Fewer than 18 but at least one valid: the smaller batch is allowed.
+- `Feed …` warnings: that feed was skipped for this run, because its site's
+  `robots.txt` closes it or could not be read, or the site refused the request or
+  timed out. The category's other feeds are still used. Replace a feed that is
+  skipped on every run.
+- `Aaj Ka Sach: recent posts could not be read`: this run did not check Aaj Ka Sach's
+  headlines. The source split still keeps the two sites off the same source articles.
 - HTTP 401/403: check the TV10 token, project and dataset. Do not change to the other
   site's project ID to work around an authentication failure.
 - Evidence/length errors: the article is rejected, not padded or given invented proof.
